@@ -1,12 +1,5 @@
-```javascript
 import { Client } from 'discord.js-selfbot-v13';
-import {
-  Streamer,
-  prepareStream,
-  playStream,
-  Utils,
-} from '@dank074/discord-video-stream';
-
+import { Streamer, prepareStream, playStream, Utils } from '@dank074/discord-video-stream';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
@@ -22,372 +15,124 @@ const {
 } = process.env;
 
 if (!USER_TOKEN) {
-  console.error('[CONFIG] USER_TOKEN belum diisi.');
+  console.error('USER_TOKEN belum diisi di Variables Railway.');
   process.exit(1);
 }
 
 const streamer = new Streamer(new Client());
+let current = null; // { command }
 
-let current = null;
-let starting = false;
+process.on('unhandledRejection', (e) => console.error('[unhandled]', e));
+process.on('SIGTERM', async () => { await stopStream(); process.exit(0); });
 
-// ==================================================
-// ERROR HANDLING
-// ==================================================
-
-process.on('unhandledRejection', (error) => {
-  console.error('[UNHANDLED REJECTION]', error);
-});
-
-process.on('uncaughtException', (error) => {
-  console.error('[UNCAUGHT EXCEPTION]', error);
-});
-
-// ==================================================
-// ENVIRONMENT CHECK
-// ==================================================
-
-async function checkEnvironment() {
-  console.log('[CHECK] Memeriksa FFmpeg...');
-
+function isYouTube(u) {
   try {
-    const { stdout } = await run('ffmpeg', ['-version'], {
-      timeout: 10000,
-    });
-
-    console.log('[CHECK] FFmpeg tersedia:', stdout.split('\n')[0]);
-  } catch (error) {
-    console.error('[CHECK] FFmpeg tidak tersedia:', error.message);
-  }
-
-  console.log('[CHECK] Memeriksa yt-dlp...');
-
-  try {
-    const { stdout } = await run('yt-dlp', ['--version'], {
-      timeout: 10000,
-    });
-
-    console.log('[CHECK] yt-dlp tersedia:', stdout.trim());
-  } catch (error) {
-    console.error('[CHECK] yt-dlp tidak tersedia:', error.message);
-  }
-}
-
-// ==================================================
-// YOUTUBE DETECTION
-// ==================================================
-
-function isYouTube(url) {
-  try {
-    const hostname = new URL(url).hostname
-      .toLowerCase()
-      .replace(/^www\./, '');
-
-    return [
-      'youtube.com',
-      'm.youtube.com',
-      'music.youtube.com',
-      'youtu.be',
-    ].includes(hostname);
+    const h = new URL(u).hostname.replace(/^www\./, '');
+    return h === 'youtube.com' || h === 'm.youtube.com' || h === 'music.youtube.com' || h === 'youtu.be';
   } catch {
     return false;
   }
 }
 
-// ==================================================
-// SOURCE RESOLVER
-// ==================================================
-
+// Ubah link YouTube jadi link video langsung (gabungan video+audio, max 720p)
 async function resolveSource(url) {
-  if (!isYouTube(url)) {
-    return url;
-  }
-
-  console.log('[YT-DLP] Resolving YouTube URL...');
-
+  if (!isYouTube(url)) return url;
+  console.log('[yt-dlp] resolving', url);
   try {
     const { stdout } = await run(
       'yt-dlp',
       [
         '--no-playlist',
-        '--js-runtimes',
-        'node',
-        '-f',
-        'b[height<=720]/b',
+        '--js-runtimes', 'node',
+        '-f', 'b[height<=720]/b',
         '-g',
         url,
       ],
-      {
-        timeout: 60000,
-        maxBuffer: 1024 * 1024,
-      },
+      { timeout: 60000, maxBuffer: 1024 * 1024 },
     );
-
-    const direct = stdout.trim().split(/\r?\n/)[0];
-
-    if (!direct) {
-      throw new Error('URL video langsung tidak ditemukan.');
-    }
-
-    console.log('[YT-DLP] URL berhasil diperoleh.');
-
+    const direct = stdout.trim().split('\n')[0];
+    if (!direct) throw new Error('yt-dlp tidak mengembalikan link.');
     return direct;
-  } catch (error) {
-    console.error(
-      '[YT-DLP ERROR]',
-      error.stderr || error.message,
-    );
-
-    throw new Error(
-      'Gagal mengambil sumber YouTube. Periksa URL, pembatasan video, dan log yt-dlp.',
-    );
+  } catch (e) {
+    console.error('[yt-dlp]', e.stderr || e.message);
+    throw new Error('Gagal mengambil video YouTube (lihat log). Bisa karena diblokir YouTube atau video dibatasi.');
   }
 }
-
-// ==================================================
-// STOP STREAM
-// ==================================================
 
 async function stopStream() {
-  const session = current;
-
+  if (!current) return;
+  try { current.command.kill('SIGINT'); } catch {}
+  try { streamer.leaveVoice(); } catch {}
   current = null;
-
-  if (session?.command) {
-    try {
-      session.command.kill('SIGINT');
-    } catch (error) {
-      console.error('[STOP] Gagal menghentikan FFmpeg:', error.message);
-    }
-  }
-
-  try {
-    streamer.leaveVoice();
-  } catch (error) {
-    console.error('[STOP] Gagal keluar dari voice:', error.message);
-  }
-
-  console.log('[STOP] Proses penghentian selesai.');
 }
-
-// ==================================================
-// START STREAM
-// ==================================================
 
 async function startStream(source, channelId) {
-  if (starting) {
-    throw new Error('Proses streaming lain sedang dimulai.');
-  }
+  await stopStream();
 
-  starting = true;
+  const channel = await streamer.client.channels.fetch(channelId);
+  if (!channel?.guildId) throw new Error('Channel tidak ditemukan atau bukan voice channel server.');
 
-  try {
-    await stopStream();
+  const perms = channel.permissionsFor?.(streamer.client.user);
+  console.log(
+    `[join] guild=${channel.guildId} channel=${channel.id} name=${channel.name} type=${channel.type}`,
+    `connect=${perms?.has('CONNECT')} speak=${perms?.has('SPEAK')}`,
+    `userLimit=${channel.userLimit} members=${channel.members?.size}`,
+  );
 
-    console.log('[JOIN] Mengambil channel:', channelId);
+  const joined = streamer.joinVoice(channel.guildId, channel.id);
+  const timeout = new Promise((_, rej) =>
+    setTimeout(() => rej(new Error('joinVoice timeout 20 detik (voice tidak tersambung).')), 20000),
+  );
+  await Promise.race([joined, timeout]);
+  console.log('[join] joinVoice selesai');
 
-    const channel = await streamer.client.channels.fetch(channelId);
+  const direct = await resolveSource(source);
 
-    if (!channel) {
-      throw new Error('Channel tidak ditemukan.');
-    }
+  const { command, output } = prepareStream(direct, {
+    width: Number(VIDEO_WIDTH),
+    height: Number(VIDEO_HEIGHT),
+    frameRate: Number(VIDEO_FPS),
+    bitrateVideo: Number(VIDEO_BITRATE),
+    videoCodec: Utils.normalizeVideoCodec('H264'),
+  });
+  command.on('error', (e) => console.error('[ffmpeg]', e.message));
+  current = { command };
 
-    if (!channel.guildId) {
-      throw new Error('Channel bukan voice channel di server.');
-    }
-
-    console.log('[JOIN] Channel ditemukan:', channel.name);
-    console.log('[JOIN] Guild ID:', channel.guildId);
-    console.log('[JOIN] Channel ID:', channel.id);
-
-    const joined = streamer.joinVoice(
-      channel.guildId,
-      channel.id,
-    );
-
-    let timeoutId;
-
-    try {
-      await Promise.race([
-        joined,
-        new Promise((_, reject) => {
-          timeoutId = setTimeout(() => {
-            reject(
-              new Error('Timeout saat mencoba masuk voice channel.'),
-            );
-          }, 20000);
-        }),
-      ]);
-    } finally {
-      clearTimeout(timeoutId);
-    }
-
-    console.log('[JOIN] joinVoice selesai.');
-
-    console.log('[SOURCE] Menyiapkan sumber video...');
-
-    const direct = await resolveSource(source);
-
-    console.log('[SOURCE] Sumber video berhasil disiapkan.');
-
-    console.log('[FFMPEG] Menyiapkan stream...');
-
-    const { command, output } = prepareStream(direct, {
-      width: Number(VIDEO_WIDTH),
-      height: Number(VIDEO_HEIGHT),
-      frameRate: Number(VIDEO_FPS),
-      bitrateVideo: Number(VIDEO_BITRATE),
-      videoCodec: Utils.normalizeVideoCodec('H264'),
-    });
-
-    command.on('error', (error) => {
-      console.error('[FFMPEG ERROR]', error.message);
-    });
-
-    command.on('close', (code, signal) => {
-      console.log(
-        `[FFMPEG] Proses berakhir. code=${code}, signal=${signal}`,
-      );
-    });
-
-    current = {
-      command,
-      channelId,
-    };
-
-    console.log('[STREAM] Memulai playStream...');
-
-    const session = current;
-
-    // Tunggu hasil playStream supaya kegagalan bisa dilaporkan.
-    const playback = playStream(output, streamer, {
-      type: 'go-live',
-    });
-
-    playback
-      .then(() => {
-        console.log('[STREAM] playStream selesai.');
-      })
-      .catch((error) => {
-        console.error('[STREAM ERROR]', error);
-      })
-      .finally(async () => {
-        if (current === session) {
-          await stopStream();
-        }
-      });
-
-    console.log(
-      '[STREAM] Proses streaming sudah dimulai, menunggu hasil playback.',
-    );
-  } finally {
-    starting = false;
-  }
+  playStream(output, streamer, { type: 'go-live' })
+    .then(() => console.log('[stream] selesai diputar'))
+    .catch((e) => console.error('[playStream]', e))
+    .finally(() => { if (current?.command === command) stopStream(); });
 }
 
-// ==================================================
-// DISCORD EVENTS
-// ==================================================
-
 streamer.client.on('ready', () => {
-  console.log(
-    `[READY] Login sebagai ${streamer.client.user.tag}`,
-  );
+  console.log(`Login sebagai ${streamer.client.user.tag}`);
 });
 
 streamer.client.on('messageCreate', async (msg) => {
-  if (msg.author.id === streamer.client.user.id) {
-    return;
-  }
+  console.log(`[msg] type=${msg.channel.type} from=${msg.author.tag} content=${msg.content}`);
 
-  if (msg.channel.type !== 'DM') {
-    return;
-  }
+  if (msg.channel.type !== 'DM') return;
+  if (msg.author.id === streamer.client.user.id) return;
 
-  console.log(
-    `[MESSAGE] author=${msg.author.tag} content=${msg.content}`,
-  );
-
-  const args = msg.content.trim().split(/\s+/);
-  const cmd = args[0]?.toLowerCase();
+  const [cmd, url, chanArg] = msg.content.trim().split(/\s+/);
 
   try {
     if (cmd === ',play') {
-      const source = args[1];
-
-      const channelId = args[2] || DEFAULT_CHANNEL_ID;
-
-      if (!source || !/^https?:\/\//i.test(source)) {
-        await msg.reply(
-          'Gunakan: `,play <URL video> [channelId]`',
-        );
-        return;
-      }
-
-      if (!channelId) {
-        await msg.reply(
-          'Isi DEFAULT_CHANNEL_ID di Variables Railway atau sertakan channelId.',
-        );
-        return;
-      }
-
-      if (starting) {
-        await msg.reply(
-          'Proses streaming sedang disiapkan. Tunggu sebentar.',
-        );
-        return;
-      }
-
-      console.log(
-        `[PLAY] source=${source} channel=${channelId}`,
-      );
-
-      await startStream(source, channelId);
-
-      await msg.reply(
-        '▶️ Proses streaming sudah dimulai. Periksa log jika video belum muncul.',
-      );
+      if (!/^https?:\/\//i.test(url ?? '')) return msg.reply('Pakai: `,play <link video/YouTube> [channelId]`');
+      const channelId = chanArg ?? DEFAULT_CHANNEL_ID;
+      console.log(`[play] url=${url} channel=${channelId}`);
+      if (!channelId) return msg.reply('Isi DEFAULT_CHANNEL_ID di Variables, atau tulis channelId di command.');
+      await startStream(url, channelId);
+      console.log('[play] joinVoice + playStream dipanggil');
+      await msg.reply('▶️ Mulai streaming.');
     } else if (cmd === ',stop') {
       await stopStream();
-
-      await msg.reply('⏹️ Permintaan penghentian diproses.');
+      await msg.reply('⏹️ Berhenti.');
     }
-  } catch (error) {
-    console.error('[COMMAND ERROR]', error);
-
-    await msg.reply(
-      `❌ ${error.message}`,
-    ).catch(() => {});
+  } catch (e) {
+    console.error('[error]', e);
+    msg.reply(`❌ ${e.message}`).catch(() => {});
   }
 });
 
-// ==================================================
-// SHUTDOWN
-// ==================================================
-
-process.on('SIGTERM', async () => {
-  console.log('[SYSTEM] SIGTERM diterima.');
-
-  await stopStream();
-
-  process.exit(0);
-});
-
-process.on('SIGINT', async () => {
-  console.log('[SYSTEM] SIGINT diterima.');
-
-  await stopStream();
-
-  process.exit(0);
-});
-
-// ==================================================
-// START APPLICATION
-// ==================================================
-
-await checkEnvironment();
-
-console.log('[SYSTEM] Memulai login Discord...');
-
 await streamer.client.login(USER_TOKEN);
-```
