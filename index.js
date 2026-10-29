@@ -18,7 +18,7 @@ if (!USER_TOKEN) {
 const streamer = new Streamer(new Client());
 let current = null; // { command }
 
-process.on('unhandledRejection', (e) => console.error('Unhandled:', e));
+process.on('unhandledRejection', (e) => console.error('[unhandled]', e));
 process.on('SIGTERM', async () => { await stopStream(); process.exit(0); });
 
 async function stopStream() {
@@ -33,8 +33,10 @@ async function startStream(source, channelId) {
 
   const channel = await streamer.client.channels.fetch(channelId);
   if (!channel?.guildId) throw new Error('Channel tidak ditemukan atau bukan voice channel server.');
+  console.log(`[join] guild=${channel.guildId} channel=${channel.id} name=${channel.name}`);
 
   await streamer.joinVoice(channel.guildId, channel.id);
+  console.log('[join] joinVoice selesai');
 
   const { command, output } = prepareStream(source, {
     width: Number(VIDEO_WIDTH),
@@ -43,11 +45,12 @@ async function startStream(source, channelId) {
     bitrateVideo: Number(VIDEO_BITRATE),
     videoCodec: Utils.normalizeVideoCodec('H264'),
   });
-  command.on('error', (e) => console.error('ffmpeg:', e.message));
+  command.on('error', (e) => console.error('[ffmpeg]', e.message));
   current = { command };
 
   playStream(output, streamer, { type: 'go-live' })
-    .catch((e) => console.error('playStream:', e))
+    .then(() => console.log('[stream] selesai diputar'))
+    .catch((e) => console.error('[playStream]', e))
     .finally(() => { if (current?.command === command) stopStream(); });
 }
 
@@ -56,6 +59,8 @@ streamer.client.on('ready', () => {
 });
 
 streamer.client.on('messageCreate', async (msg) => {
+  console.log(`[msg] type=${msg.channel.type} from=${msg.author.tag} content=${msg.content}`);
+
   if (msg.channel.type !== 'DM') return;                  // hanya DM
   if (msg.author.id === streamer.client.user.id) return;  // abaikan pesan akun ini sendiri
 
@@ -65,15 +70,17 @@ streamer.client.on('messageCreate', async (msg) => {
     if (cmd === ',play') {
       if (!/^https?:\/\//i.test(url ?? '')) return msg.reply('Pakai: `,play <link video> [channelId]`');
       const channelId = chanArg ?? DEFAULT_CHANNEL_ID;
+      console.log(`[play] url=${url} channel=${channelId}`);
       if (!channelId) return msg.reply('Isi DEFAULT_CHANNEL_ID di Variables, atau tulis channelId di command.');
       await startStream(url, channelId);
+      console.log('[play] joinVoice + playStream dipanggil');
       await msg.reply('▶️ Mulai streaming.');
     } else if (cmd === ',stop') {
       await stopStream();
       await msg.reply('⏹️ Berhenti.');
     }
   } catch (e) {
-    console.error(e);
+    console.error('[error]', e);
     msg.reply(`❌ ${e.message}`).catch(() => {});
   }
 });
