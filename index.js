@@ -1,132 +1,155 @@
 import { Client } from 'discord.js-selfbot-v13';
-import { Streamer, prepareStream, playStream, Utils } from '@dank074/discord-video-stream';
-import { execFile } from 'node:child_process';
+import {
+  joinVoiceChannel,
+  createAudioPlayer,
+  createAudioResource,
+  entersState,
+  getVoiceConnection,
+  AudioPlayerStatus,
+  NoSubscriberBehavior,
+  StreamType,
+  VoiceConnectionStatus,
+} from '@discordjs/voice';
+import { spawn, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
 const run = promisify(execFile);
-
-const {
-  USER_TOKEN,
-  DEFAULT_CHANNEL_ID,
-  VIDEO_WIDTH = '854',
-  VIDEO_HEIGHT = '480',
-  VIDEO_FPS = '30',
-  VIDEO_BITRATE = '1500',
-} = process.env;
+const { USER_TOKEN, DEFAULT_CHANNEL_ID } = process.env;
 
 if (!USER_TOKEN) {
   console.error('USER_TOKEN belum diisi di Variables Railway.');
   process.exit(1);
 }
 
-const streamer = new Streamer(new Client());
-let current = null; // { command }
+const client = new Client();
+const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } });
+let ffmpeg = null;
+let guildId = null;
 
 process.on('unhandledRejection', (e) => console.error('[unhandled]', e));
-process.on('SIGTERM', async () => { await stopStream(); process.exit(0); });
 
-function isYouTube(u) {
-  try {
-    const h = new URL(u).hostname.replace(/^www\./, '');
-    return h === 'youtube.com' || h === 'm.youtube.com' || h === 'music.youtube.com' || h === 'youtu.be';
-  } catch {
-    return false;
+player.on('error', (e) => console.error('[player]', e.message));
+player.on(AudioPlayerStatus.Idle, () => console.log('[player] selesai / idle'));
+
+// Link YouTube / judul lagu -> { title, url } (link audio langsung)
+async function resolve(input) {
+  const isUrl = /^https?:\/\//i.test(input);
+  if (isUrl && !/(youtube\.com|youtu\.be)/i.test(input)) {
+    return { title: input, url: input }; // direct audio/video link
   }
-}
-
-// Ubah link YouTube jadi link video langsung (gabungan video+audio, max 720p)
-async function resolveSource(url) {
-  if (!isYouTube(url)) return url;
-  console.log('[yt-dlp] resolving', url);
+  const target = isUrl ? input : `ytsearch1:${input}`;
+  console.log('[yt-dlp] resolving', target);
   try {
     const { stdout } = await run(
       'yt-dlp',
-      [
-        '--no-playlist',
-        '--js-runtimes', 'node',
-        '-f', 'b[height<=720]/b',
-        '-g',
-        url,
-      ],
+      ['--no-playlist', '--js-runtimes', 'node', '-f', 'bestaudio/best',
+       '--print', '%(title)s', '--print', 'urls', target],
       { timeout: 60000, maxBuffer: 1024 * 1024 },
     );
-    const direct = stdout.trim().split('\n')[0];
-    if (!direct) throw new Error('yt-dlp tidak mengembalikan link.');
-    return direct;
+    const lines = stdout.trim().split('\n').filter(Boolean);
+    if (lines.length < 2) throw new Error('hasil kosong');
+    return { title: lines[0], url: lines[lines.length - 1] };
   } catch (e) {
     console.error('[yt-dlp]', e.stderr || e.message);
-    throw new Error('Gagal mengambil video YouTube (lihat log). Bisa karena diblokir YouTube atau video dibatasi.');
+    throw new Error('Gagal mengambil audio (lihat log). Bisa diblokir YouTube atau tidak ditemukan.');
   }
 }
 
-async function stopStream() {
-  if (!current) return;
-  try { current.command.kill('SIGINT'); } catch {}
-  try { streamer.leaveVoice(); } catch {}
-  current = null;
+function killFfmpeg() {
+  try { ffmpeg?.kill('SIGKILL'); } catch {}
+  ffmpeg = null;
 }
 
-async function startStream(source, channelId) {
-  await stopStream();
+function stopAll() {
+  killFfmpeg();
+  try { player.stop(true); } catch {}
+  if (guildId) {
+    try { getVoiceConnection(guildId)?.destroy(); } catch {}
+    guildId = null;
+  }
+}
 
-  const channel = await streamer.client.channels.fetch(channelId);
+async function play(input, channelId) {
+  const channel = await client.channels.fetch(channelId);
   if (!channel?.guildId) throw new Error('Channel tidak ditemukan atau bukan voice channel server.');
 
-  const perms = channel.permissionsFor?.(streamer.client.user);
+  const perms = channel.permissionsFor?.(client.user);
   console.log(
     `[join] guild=${channel.guildId} channel=${channel.id} name=${channel.name} type=${channel.type}`,
-    `connect=${perms?.has('CONNECT')} speak=${perms?.has('SPEAK')}`,
-    `userLimit=${channel.userLimit} members=${channel.members?.size}`,
+    `connect=${perms?.has('CONNECT')} speak=${perms?.has('SPEAK')} userLimit=${channel.userLimit}`,
   );
 
-  const joined = streamer.joinVoice(channel.guildId, channel.id);
-  const timeout = new Promise((_, rej) =>
-    setTimeout(() => rej(new Error('joinVoice timeout 20 detik (voice tidak tersambung).')), 20000),
-  );
-  await Promise.race([joined, timeout]);
-  console.log('[join] joinVoice selesai');
+  const { title, url } = await resolve(input);
 
-  const direct = await resolveSource(source);
+  killFfmpeg();
+  player.stop(true);
 
-  const { command, output } = prepareStream(direct, {
-    width: Number(VIDEO_WIDTH),
-    height: Number(VIDEO_HEIGHT),
-    frameRate: Number(VIDEO_FPS),
-    bitrateVideo: Number(VIDEO_BITRATE),
-    videoCodec: Utils.normalizeVideoCodec('H264'),
-  });
-  command.on('error', (e) => console.error('[ffmpeg]', e.message));
-  current = { command };
+  let connection = getVoiceConnection(channel.guildId);
+  if (!connection || connection.joinConfig.channelId !== channel.id) {
+    connection?.destroy();
+    connection = joinVoiceChannel({
+      channelId: channel.id,
+      guildId: channel.guildId,
+      adapterCreator: channel.guild.voiceAdapterCreator,
+      selfDeaf: false,
+      selfMute: false,
+    });
+    connection.on('stateChange', (o, n) => console.log(`[voice] ${o.status} -> ${n.status}`));
+    connection.on('error', (e) => console.error('[voice error]', e));
+  }
+  guildId = channel.guildId;
 
-  playStream(output, streamer, { type: 'go-live' })
-    .then(() => console.log('[stream] selesai diputar'))
-    .catch((e) => console.error('[playStream]', e))
-    .finally(() => { if (current?.command === command) stopStream(); });
+  try {
+    await entersState(connection, VoiceConnectionStatus.Ready, 20000);
+  } catch {
+    connection.destroy();
+    guildId = null;
+    throw new Error('Voice tidak tersambung dalam 20 detik (lihat log [voice]).');
+  }
+  console.log('[join] voice Ready');
+
+  ffmpeg = spawn('ffmpeg', [
+    '-hide_banner', '-loglevel', 'warning',
+    '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
+    '-i', url,
+    '-vn', '-c:a', 'libopus', '-b:a', '96k', '-ar', '48000', '-ac', '2',
+    '-f', 'ogg', 'pipe:1',
+  ]);
+  ffmpeg.stderr.on('data', (d) => console.error('[ffmpeg]', d.toString().trim()));
+  ffmpeg.on('error', (e) => console.error('[ffmpeg start]', e.message));
+
+  const resource = createAudioResource(ffmpeg.stdout, { inputType: StreamType.OggOpus });
+  player.play(resource);
+  connection.subscribe(player);
+
+  return title;
 }
 
-streamer.client.on('ready', () => {
-  console.log(`Login sebagai ${streamer.client.user.tag}`);
-});
+client.on('ready', () => console.log(`Login sebagai ${client.user.tag}`));
 
-streamer.client.on('messageCreate', async (msg) => {
+client.on('messageCreate', async (msg) => {
   console.log(`[msg] type=${msg.channel.type} from=${msg.author.tag} content=${msg.content}`);
-
   if (msg.channel.type !== 'DM') return;
-  if (msg.author.id === streamer.client.user.id) return;
+  if (msg.author.id === client.user.id) return;
 
-  const [cmd, url, chanArg] = msg.content.trim().split(/\s+/);
+  const text = msg.content.trim();
+  const [cmd, ...rest] = text.split(/\s+/);
+  const arg = rest.join(' ');
 
   try {
     if (cmd === ',play') {
-      if (!/^https?:\/\//i.test(url ?? '')) return msg.reply('Pakai: `,play <link video/YouTube> [channelId]`');
-      const channelId = chanArg ?? DEFAULT_CHANNEL_ID;
-      console.log(`[play] url=${url} channel=${channelId}`);
-      if (!channelId) return msg.reply('Isi DEFAULT_CHANNEL_ID di Variables, atau tulis channelId di command.');
-      await startStream(url, channelId);
-      console.log('[play] joinVoice + playStream dipanggil');
-      await msg.reply('▶️ Mulai streaming.');
+      if (!arg) return msg.reply('Pakai: `,play <link atau judul lagu>`');
+      if (!DEFAULT_CHANNEL_ID) return msg.reply('Isi DEFAULT_CHANNEL_ID di Variables Railway.');
+      const title = await play(arg, DEFAULT_CHANNEL_ID);
+      await msg.reply(`▶️ Memutar: ${title}`);
+    } else if (cmd === ',pause') {
+      player.pause();
+      await msg.reply('⏸️ Pause.');
+    } else if (cmd === ',resume') {
+      player.unpause();
+      await msg.reply('▶️ Lanjut.');
     } else if (cmd === ',stop') {
-      await stopStream();
+      stopAll();
       await msg.reply('⏹️ Berhenti.');
     }
   } catch (e) {
@@ -135,4 +158,4 @@ streamer.client.on('messageCreate', async (msg) => {
   }
 });
 
-await streamer.client.login(USER_TOKEN);
+await client.login(USER_TOKEN);
