@@ -10,6 +10,7 @@
     "@discordjs/voice": "latest",
     "@snazzah/davey": "latest",
     "discord.js-selfbot-v13": "latest",
-    "libsodium-wrappers": "latest"
+    "libsodium-wrappers": "latest",
+    "opusscript": "latest"
   }
 }
