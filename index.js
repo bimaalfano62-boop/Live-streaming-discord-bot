@@ -31,11 +31,20 @@ process.on('unhandledRejection', (e) => console.error('[unhandled]', e));
 player.on('error', (e) => console.error('[player]', e.message));
 player.on(AudioPlayerStatus.Idle, () => console.log('[player] selesai / idle'));
 
+// Cari voice channel tempat user sedang berada (di server yang sama dengan akun ini)
+function findUserVoiceChannelId(userId) {
+  for (const guild of client.guilds.cache.values()) {
+    const vs = guild.voiceStates?.cache.get(userId);
+    if (vs?.channelId) return vs.channelId;
+  }
+  return null;
+}
+
 // Link YouTube / judul lagu -> { title, url } (link audio langsung)
 async function resolve(input) {
   const isUrl = /^https?:\/\//i.test(input);
   if (isUrl && !/(youtube\.com|youtu\.be)/i.test(input)) {
-    return { title: input, url: input }; // direct audio/video link
+    return { title: input, url: input }; // link audio/video langsung
   }
   const target = isUrl ? input : `ytsearch1:${input}`;
   console.log('[yt-dlp] resolving', target);
@@ -84,6 +93,11 @@ async function play(input, channelId) {
   killFfmpeg();
   player.stop(true);
 
+  // kalau sebelumnya ada di server lain, keluar dulu
+  if (guildId && guildId !== channel.guildId) {
+    try { getVoiceConnection(guildId)?.destroy(); } catch {}
+  }
+
   let connection = getVoiceConnection(channel.guildId);
   if (!connection || connection.joinConfig.channelId !== channel.id) {
     connection?.destroy();
@@ -122,7 +136,7 @@ async function play(input, channelId) {
   player.play(resource);
   connection.subscribe(player);
 
-  return title;
+  return { title, channelName: channel.name };
 }
 
 client.on('ready', () => console.log(`Login sebagai ${client.user.tag}`));
@@ -132,16 +146,23 @@ client.on('messageCreate', async (msg) => {
   if (msg.channel.type !== 'DM') return;
   if (msg.author.id === client.user.id) return;
 
-  const text = msg.content.trim();
-  const [cmd, ...rest] = text.split(/\s+/);
+  const [cmd, ...rest] = msg.content.trim().split(/\s+/);
   const arg = rest.join(' ');
 
   try {
     if (cmd === ',play') {
       if (!arg) return msg.reply('Pakai: `,play <link atau judul lagu>`');
-      if (!DEFAULT_CHANNEL_ID) return msg.reply('Isi DEFAULT_CHANNEL_ID di Variables Railway.');
-      const title = await play(arg, DEFAULT_CHANNEL_ID);
-      await msg.reply(`▶️ Memutar: ${title}`);
+
+      const userChannelId = findUserVoiceChannelId(msg.author.id);
+      const channelId = userChannelId ?? DEFAULT_CHANNEL_ID;
+      console.log(`[play] user=${msg.author.tag} userChannel=${userChannelId} pakai=${channelId}`);
+
+      if (!channelId) {
+        return msg.reply('Kamu belum ada di voice channel (di server yang sama dengan akun ini). Masuk voice dulu, lalu `,play` lagi.');
+      }
+
+      const { title, channelName } = await play(arg, channelId);
+      await msg.reply(`▶️ Memutar: ${title}\n🔊 Di: ${channelName}`);
     } else if (cmd === ',pause') {
       player.pause();
       await msg.reply('⏸️ Pause.');
