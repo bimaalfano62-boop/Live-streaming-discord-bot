@@ -428,4 +428,54 @@ client.on('messageCreate', async (msg) => {
         if (a) {
           state.loop = map[a];
         } else {
-          state.loop = state.loop === 'off' ? 'track' : state.loop === 'track' ? 'queue' :
+          state.loop = state.loop === 'off' ? 'track' : state.loop === 'track' ? 'queue' : 'off';
+        }
+        await msg.reply(`🔁 Loop: ${LOOP_LABEL[state.loop]}`);
+        break;
+      }
+
+      case ',volume':
+      case ',vol': {
+        if (!arg) return msg.reply(`🔊 Volume: ${Math.round(state.volume * 100)}%`);
+        const n = Number(arg.replace('%', ''));
+        if (!Number.isFinite(n) || n < 0 || n > 200) return msg.reply('Pakai: `,volume <0-200>` (100 = normal)');
+        state.volume = n / 100;
+        if (voice.guildId) await patchPlayer({ volume: Math.round(n) });
+        await msg.reply(`🔊 Volume: ${n}%`);
+        break;
+      }
+
+      case ',np': {
+        if (!state.current) return msg.reply('Tidak ada lagu yang sedang diputar.');
+        await msg.reply(`🎵 ${state.current.title}${state.current.author ? ` — ${state.current.author}` : ''}\nLoop: ${LOOP_LABEL[state.loop]} | Volume: ${Math.round(state.volume * 100)}% | Antrean: ${state.queue.length}`);
+        break;
+      }
+
+      case ',pause':
+        await patchPlayer({ paused: true });
+        await msg.reply('⏸️ Pause.');
+        break;
+
+      case ',resume':
+        await patchPlayer({ paused: false });
+        await msg.reply('▶️ Lanjut.');
+        break;
+
+      case ',stop':
+        await clearAll(); // bot TETAP di voice
+        await msg.reply('⏹️ Dihentikan & antrean dikosongkan. Bot tetap di voice (`,leave` untuk keluar).');
+        break;
+
+      case ',leave':
+        await clearAll();
+        await leaveChannel();
+        await msg.reply('👋 Keluar dari voice.');
+        break;
+    }
+  } catch (e) {
+    console.error('[error]', e);
+    msg.reply(`❌ ${e.message}`).catch(() => {});
+  }
+});
+
+await client.login(USER_TOKEN);
