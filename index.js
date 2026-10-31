@@ -15,8 +15,8 @@ if (!USER_TOKEN || !LAVALINK_PASSWORD) {
   process.exit(1);
 }
 
-// urutan pencarian: ytmsearch (YouTube Music), ytsearch (YouTube), scsearch (SoundCloud)
-const SEARCH_ORDER = (process.env.SEARCH_ORDER || 'ytmsearch,ytsearch,scsearch')
+// urutan pencarian: scsearch (SoundCloud), ytmsearch (YouTube Music), ytsearch (YouTube)
+const SEARCH_ORDER = (process.env.SEARCH_ORDER || 'scsearch,ytmsearch,ytsearch')
   .split(',').map((s) => s.trim()).filter(Boolean);
 
 const secure = LAVALINK_SECURE === 'true';
@@ -30,7 +30,7 @@ const MAX_PLAYLIST = 50;
 const client = new Client();
 
 const state = {
-  queue: [],       // item: { title, author, encoded, uri }
+  queue: [],       // item: { title, author, encoded, uri, query?, srcIndex? }
   current: null,
   loop: 'off',     // off | track | queue
   volume: 1,       // 1 = 100%
@@ -267,24 +267,34 @@ async function loadTracks(identifier) {
 
 const toItem = (t) => ({ title: t.info.title, author: t.info.author, encoded: t.encoded, uri: t.info.uri });
 
-// input = judul lagu ATAU link (video / playlist)
-async function resolve(input) {
+// input = judul lagu ATAU link (video / playlist); startIdx = mulai dari sumber ke-berapa di SEARCH_ORDER
+async function resolveFrom(input, startIdx = 0) {
   const isUrl = /^https?:\/\//i.test(input);
-  const ids = isUrl ? [input] : SEARCH_ORDER.map((p) => `${p}:${input}`);
+
+  if (isUrl) {
+    const tracks = await loadTracks(input);
+    if (!tracks.length) throw new Error('Link tidak ditemukan atau tidak bisa dimuat.');
+    return tracks.map(toItem);
+  }
 
   let lastErr;
-  for (const id of ids) {
+  for (let i = startIdx; i < SEARCH_ORDER.length; i++) {
+    const id = `${SEARCH_ORDER[i]}:${input}`;
     try {
       const tracks = await loadTracks(id);
-      if (tracks.length) return tracks.map(toItem);
+      if (tracks.length) return tracks.map((t) => ({ ...toItem(t), query: input, srcIndex: i }));
       console.log(`[search] ${id} -> kosong`);
     } catch (e) {
       lastErr = e;
       console.error(`[search] ${id} -> ${e.message}`);
     }
   }
-  throw new Error(lastErr ? `Gagal memuat lagu: ${lastErr.message}` : `Lagu "${input}" tidak ditemukan. Coba tambahkan nama artis.`);
+  throw new Error(lastErr
+    ? `Gagal memuat lagu: ${lastErr.message}`
+    : `Lagu "${input}" tidak ditemukan. Coba tambahkan nama artis.`);
 }
+
+const resolve = (input) => resolveFrom(input, 0);
 
 // ---------- pemutaran ----------
 async function startTrack(item) {
@@ -322,6 +332,22 @@ async function onTrackEnd(reason) {
   const ended = state.current;
   const skipped = state.skipFlag;
   state.skipFlag = false;
+
+  // gagal diputar dari sumber ini -> coba sumber pencarian berikutnya untuk lagu yang sama
+  if (reason === 'loadFailed' && !skipped && ended.query != null && ended.srcIndex != null) {
+    try {
+      const alt = await resolveFrom(ended.query, ended.srcIndex + 1);
+      if (alt.length) {
+        console.log(`[fallback] gagal di ${SEARCH_ORDER[ended.srcIndex]}, coba ${SEARCH_ORDER[alt[0].srcIndex]}`);
+        say(`🔄 Gagal memutar dari ${SEARCH_ORDER[ended.srcIndex]}, mencoba sumber lain...`);
+        await advance(alt[0], true);
+        return;
+      }
+    } catch (e) {
+      console.error('[fallback] semua sumber habis:', e.message);
+    }
+  }
+
   const failed = reason === 'loadFailed' || (!skipped && Date.now() - state.startedAt < 3000);
 
   let next;
@@ -350,9 +376,9 @@ client.once('ready', () => {
 });
 
 client.on('messageCreate', async (msg) => {
-  console.log(`[msg] type=${msg.channel.type} from=${msg.author.tag} content=${msg.content}`);
   if (msg.channel.type !== 'DM') return;
   if (msg.author.id === client.user.id) return;
+  console.log(`[dm] from=${msg.author.tag} content=${msg.content}`);
 
   const [rawCmd, ...rest] = msg.content.trim().split(/\s+/);
   const cmd = rawCmd.toLowerCase();
@@ -368,6 +394,10 @@ client.on('messageCreate', async (msg) => {
       case ',play':
       case ',p': {
         if (!arg) return msg.reply('Pakai: `,play <judul lagu>` contoh: `,play hindia rumah ke rumah`');
+
+        if (!lavaSession) {
+          return msg.reply('⏳ Lavalink sedang restart atau belum tersambung. Coba lagi dalam sekitar 30 detik.');
+        }
 
         const userChannelId = findUserVoiceChannelId(msg.author.id);
         const channelId = userChannelId ?? voice.channelId ?? DEFAULT_CHANNEL_ID;
