@@ -174,7 +174,17 @@ function sendGateway(guildId, payload) {
 
 async function pushVoice() {
   const { guildId, channelId, sessionId, token, endpoint } = voice;
-  if (!lavaSession || !guildId || !channelId || !sessionId || !token || !endpoint) return;
+  const missing = [];
+  if (!lavaSession) missing.push('lavalinkSession');
+  if (!guildId) missing.push('guildId');
+  if (!channelId) missing.push('channelId');
+  if (!sessionId) missing.push('voiceSessionId');
+  if (!token) missing.push('voiceToken');
+  if (!endpoint) missing.push('voiceEndpoint');
+  if (missing.length) {
+    console.log('[voice] menunggu:', missing.join(', '));
+    return;
+  }
   await lava('PATCH', `/v4/sessions/${lavaSession}/players/${guildId}`, {
     voice: { token, endpoint, sessionId, channelId },
   });
@@ -186,22 +196,24 @@ client.on('raw', (p) => {
   if (!p?.t || !p.d) return;
 
   if (p.t === 'VOICE_STATE_UPDATE' && p.d.user_id === client.user.id) {
-    console.log(`[voice-state] channel=${p.d.channel_id}`);
+    console.log(`[raw] VOICE_STATE_UPDATE channel=${p.d.channel_id} guild=${p.d.guild_id}`);
     if (p.d.channel_id) {
       voice.sessionId = p.d.session_id;
       pushVoice().catch((e) => console.error('[voice push]', e.message));
-    } else if (voice.guildId) {
-      // ditendang / diputus dari voice
+    } else if (voice.guildId && voice.pushed) {
+      // ditendang / diputus setelah sempat tersambung
       console.log('[voice] terputus dari voice channel');
       forcedLeave();
     }
   }
 
-  if (p.t === 'VOICE_SERVER_UPDATE' && p.d.guild_id === voice.guildId) {
-    voice.token = p.d.token;
-    voice.endpoint = p.d.endpoint;
-    console.log('[voice] server update:', p.d.endpoint);
-    pushVoice().catch((e) => console.error('[voice push]', e.message));
+  if (p.t === 'VOICE_SERVER_UPDATE') {
+    console.log(`[raw] VOICE_SERVER_UPDATE guild=${p.d.guild_id} endpoint=${p.d.endpoint}`);
+    if (p.d.guild_id === voice.guildId) {
+      voice.token = p.d.token;
+      voice.endpoint = p.d.endpoint;
+      pushVoice().catch((e) => console.error('[voice push]', e.message));
+    }
   }
 });
 
@@ -217,6 +229,12 @@ async function joinChannel(channel) {
   try {
     await waitFor(() => voice.pushed, 20000, 'Voice tidak tersambung dalam 20 detik (cek log [voice] dan [lavalink]).');
   } catch (e) {
+    console.error('[join] timeout. status:', JSON.stringify({
+      lavalinkSiap: Boolean(lavaSession),
+      voiceSessionId: Boolean(voice.sessionId),
+      voiceToken: Boolean(voice.token),
+      voiceEndpoint: voice.endpoint,
+    }));
     await leaveChannel();
     throw e;
   }
@@ -410,54 +428,4 @@ client.on('messageCreate', async (msg) => {
         if (a) {
           state.loop = map[a];
         } else {
-          state.loop = state.loop === 'off' ? 'track' : state.loop === 'track' ? 'queue' : 'off';
-        }
-        await msg.reply(`🔁 Loop: ${LOOP_LABEL[state.loop]}`);
-        break;
-      }
-
-      case ',volume':
-      case ',vol': {
-        if (!arg) return msg.reply(`🔊 Volume: ${Math.round(state.volume * 100)}%`);
-        const n = Number(arg.replace('%', ''));
-        if (!Number.isFinite(n) || n < 0 || n > 200) return msg.reply('Pakai: `,volume <0-200>` (100 = normal)');
-        state.volume = n / 100;
-        if (voice.guildId) await patchPlayer({ volume: Math.round(n) });
-        await msg.reply(`🔊 Volume: ${n}%`);
-        break;
-      }
-
-      case ',np': {
-        if (!state.current) return msg.reply('Tidak ada lagu yang sedang diputar.');
-        await msg.reply(`🎵 ${state.current.title}${state.current.author ? ` — ${state.current.author}` : ''}\nLoop: ${LOOP_LABEL[state.loop]} | Volume: ${Math.round(state.volume * 100)}% | Antrean: ${state.queue.length}`);
-        break;
-      }
-
-      case ',pause':
-        await patchPlayer({ paused: true });
-        await msg.reply('⏸️ Pause.');
-        break;
-
-      case ',resume':
-        await patchPlayer({ paused: false });
-        await msg.reply('▶️ Lanjut.');
-        break;
-
-      case ',stop':
-        await clearAll(); // bot TETAP di voice
-        await msg.reply('⏹️ Dihentikan & antrean dikosongkan. Bot tetap di voice (`,leave` untuk keluar).');
-        break;
-
-      case ',leave':
-        await clearAll();
-        await leaveChannel();
-        await msg.reply('👋 Keluar dari voice.');
-        break;
-    }
-  } catch (e) {
-    console.error('[error]', e);
-    msg.reply(`❌ ${e.message}`).catch(() => {});
-  }
-});
-
-await client.login(USER_TOKEN);
+          state.loop = state.loop === 'off' ? 'track' : state.loop === 'track' ? 'queue' :
