@@ -23,7 +23,6 @@ const secure = LAVALINK_SECURE === 'true';
 const hostPort = LAVALINK_PORT ? `${LAVALINK_HOST}:${LAVALINK_PORT}` : LAVALINK_HOST;
 const HTTP_BASE = `${secure ? 'https' : 'http'}://${hostPort}`;
 const WS_BASE = `${secure ? 'wss' : 'ws'}://${hostPort}`;
-console.log(`[config] host=${HTTP_BASE} | panjang password=${LAVALINK_PASSWORD.length} | awal=${LAVALINK_PASSWORD.slice(0, 2)} | akhir=${LAVALINK_PASSWORD.slice(-2)}`);
 
 const MAX_QUEUE = 100;
 const MAX_PLAYLIST = 50;
@@ -45,6 +44,7 @@ const voice = { guildId: null, channelId: null, sessionId: null, token: null, en
 
 let ws = null;
 let lavaSession = null;
+let reconnectTimer = null;
 
 process.on('unhandledRejection', (e) => console.error('[unhandled]', e));
 
@@ -95,6 +95,9 @@ async function patchPlayer(body) {
 
 // ---------- Lavalink: WebSocket ----------
 function connectLavalink() {
+  clearTimeout(reconnectTimer);
+  try { ws?.removeAllListeners(); ws?.terminate(); } catch {}
+
   ws = new WebSocket(`${WS_BASE}/v4/websocket`, {
     headers: {
       Authorization: LAVALINK_PASSWORD,
@@ -102,18 +105,29 @@ function connectLavalink() {
       'Client-Name': 'selfbot-lavalink/1.0',
     },
   });
+
   ws.on('open', () => console.log('[lavalink] websocket terhubung'));
+
   ws.on('message', (raw) => {
     let m;
     try { m = JSON.parse(raw); } catch { return; }
     handleLavalink(m).catch((e) => console.error('[lavalink handler]', e));
   });
-  ws.on('error', (e) => console.error('[lavalink] error:', e.message));
-  ws.on('close', (code) => {
-    console.error('[lavalink] websocket putus, kode', code, '-> coba lagi 5 detik');
+
+  ws.on('error', (e) => {
+    const detail =
+      e.message ||
+      e.code ||
+      (e.errors || []).map((x) => `${x.code}@${x.address}:${x.port}`).join(', ') ||
+      String(e);
+    console.error('[lavalink] error:', detail);
+  });
+
+  ws.on('close', (code, reason) => {
+    console.error('[lavalink] websocket putus, kode', code, String(reason || ''), '-> coba lagi 5 detik');
     lavaSession = null;
     voice.pushed = false;
-    setTimeout(connectLavalink, 5000);
+    reconnectTimer = setTimeout(connectLavalink, 5000);
   });
 }
 
@@ -155,7 +169,7 @@ function sendGateway(guildId, payload) {
   const guild = client.guilds.cache.get(guildId);
   if (guild?.shard?.send) return guild.shard.send(payload);
   if (client.ws?.broadcast) return client.ws.broadcast(payload);
-  throw new Error('Tidak bisa mengirim voice state ke gateway (API library berbeda). Kirim info versi library ke pembuat kode.');
+  throw new Error('Tidak bisa mengirim voice state ke gateway (API library berbeda).');
 }
 
 async function pushVoice() {
@@ -312,7 +326,7 @@ async function clearAll() {
 // ---------- command ----------
 const LOOP_LABEL = { off: 'mati', track: 'lagu ini', queue: 'seluruh antrean' };
 
-client.on('ready', () => {
+client.once('ready', () => {
   console.log(`Login sebagai ${client.user.tag} | Lavalink: ${HTTP_BASE} | sumber: ${SEARCH_ORDER.join(', ')}`);
   connectLavalink();
 });
