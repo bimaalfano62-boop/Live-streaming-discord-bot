@@ -23,6 +23,7 @@ const secure = LAVALINK_SECURE === 'true';
 const hostPort = LAVALINK_PORT ? `${LAVALINK_HOST}:${LAVALINK_PORT}` : LAVALINK_HOST;
 const HTTP_BASE = `${secure ? 'https' : 'http'}://${hostPort}`;
 const WS_BASE = `${secure ? 'wss' : 'ws'}://${hostPort}`;
+console.log(`[config] host=${HTTP_BASE} | panjang password=${LAVALINK_PASSWORD.length} | awal=${LAVALINK_PASSWORD.slice(0, 2)} | akhir=${LAVALINK_PASSWORD.slice(-2)}`);
 
 const MAX_QUEUE = 100;
 const MAX_PLAYLIST = 50;
