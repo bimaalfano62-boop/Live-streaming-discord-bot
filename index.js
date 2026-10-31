@@ -1,222 +1,68 @@
 import { Client } from 'discord.js-selfbot-v13';
-import {
-  joinVoiceChannel,
-  createAudioPlayer,
-  createAudioResource,
-  entersState,
-  getVoiceConnection,
-  AudioPlayerStatus,
-  NoSubscriberBehavior,
-  StreamType,
-  VoiceConnectionStatus,
-} from '@discordjs/voice';
-import { spawn, execFile } from 'node:child_process';
-import { promisify } from 'node:util';
-import { writeFileSync } from 'node:fs';
+import WebSocket from 'ws';
 
-const run = promisify(execFile);
-const { USER_TOKEN, DEFAULT_CHANNEL_ID } = process.env;
+const {
+  USER_TOKEN,
+  DEFAULT_CHANNEL_ID,
+  LAVALINK_HOST = 'localhost',
+  LAVALINK_PORT = '2333',
+  LAVALINK_PASSWORD,
+  LAVALINK_SECURE,
+} = process.env;
 
-if (!USER_TOKEN) {
-  console.error('USER_TOKEN belum diisi di Variables Railway.');
+if (!USER_TOKEN || !LAVALINK_PASSWORD) {
+  console.error('USER_TOKEN dan LAVALINK_PASSWORD wajib diisi di Variables Railway.');
   process.exit(1);
 }
 
-// ---------- konfigurasi opsional ----------
-const SEARCH_SOURCE = (process.env.SEARCH_SOURCE || 'soundcloud').toLowerCase(); // soundcloud | youtube
-const SEARCH_FALLBACK = (process.env.SEARCH_FALLBACK || '').toLowerCase();       // '' | youtube | soundcloud
-const YT_PROXY = process.env.YT_PROXY || '';
-const MAX_QUEUE = 100;
-const URL_MAX_AGE = 20 * 60 * 1000; // refresh link kalau sudah > 20 menit di antrean
+// urutan pencarian: ytmsearch (YouTube Music), ytsearch (YouTube), scsearch (SoundCloud)
+const SEARCH_ORDER = (process.env.SEARCH_ORDER || 'ytmsearch,ytsearch,scsearch')
+  .split(',').map((s) => s.trim()).filter(Boolean);
 
-const COOKIES_PATH = '/tmp/yt-cookies.txt';
-let hasCookies = false;
-if (process.env.YT_COOKIES_B64) {
-  try {
-    writeFileSync(COOKIES_PATH, Buffer.from(process.env.YT_COOKIES_B64, 'base64'));
-    hasCookies = true;
-    console.log('[yt-dlp] cookies dimuat');
-  } catch (e) {
-    console.error('[yt-dlp] gagal menulis cookies:', e.message);
-  }
-}
+const secure = LAVALINK_SECURE === 'true';
+const hostPort = LAVALINK_PORT ? `${LAVALINK_HOST}:${LAVALINK_PORT}` : LAVALINK_HOST;
+const HTTP_BASE = `${secure ? 'https' : 'http'}://${hostPort}`;
+const WS_BASE = `${secure ? 'wss' : 'ws'}://${hostPort}`;
+
+const MAX_QUEUE = 100;
+const MAX_PLAYLIST = 50;
 
 const client = new Client();
-const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } });
 
 const state = {
-  queue: [],       // item: { title, pageUrl, streamUrl, resolvedAt, site, refresh }
+  queue: [],       // item: { title, author, encoded, uri }
   current: null,
   loop: 'off',     // off | track | queue
   volume: 1,       // 1 = 100%
-  resource: null,
   startedAt: 0,
   skipFlag: false,
-  guildId: null,
-  channelId: null,
   notify: null,    // DM channel untuk pengumuman pergantian lagu
 };
 
-let ffmpeg = null;
+// data voice yang diteruskan ke Lavalink
+const voice = { guildId: null, channelId: null, sessionId: null, token: null, endpoint: null, pushed: false };
+
+let ws = null;
+let lavaSession = null;
 
 process.on('unhandledRejection', (e) => console.error('[unhandled]', e));
 
-// ---------- pencarian / resolve ----------
-function isYouTubeUrl(u) {
-  try {
-    const h = new URL(u).hostname.replace(/^www\./, '');
-    return ['youtube.com', 'm.youtube.com', 'music.youtube.com', 'youtu.be'].includes(h);
-  } catch {
-    return false;
-  }
-}
-
-function isSoundCloudUrl(u) {
-  try {
-    return new URL(u).hostname.replace(/^www\./, '').endsWith('soundcloud.com');
-  } catch {
-    return false;
-  }
-}
-
-async function extract(target, site) {
-  const args = ['--no-playlist', '-f', 'bestaudio/best'];
-  if (site === 'youtube') {
-    args.push('--js-runtimes', 'node');
-    if (hasCookies) args.push('--cookies', COOKIES_PATH);
-    if (YT_PROXY) args.push('--proxy', YT_PROXY);
-  }
-  args.push('--print', '%(title)s', '--print', '%(webpage_url)s', '--print', 'urls', target);
-
-  console.log(`[yt-dlp] (${site}) ${target}`);
-  const { stdout } = await run('yt-dlp', args, { timeout: 60000, maxBuffer: 1024 * 1024 });
-  const lines = stdout.trim().split('\n').filter(Boolean);
-  if (lines.length < 3) throw new Error('hasil kosong');
-  return {
-    title: lines[0],
-    pageUrl: lines[1],
-    streamUrl: lines[lines.length - 1],
-    resolvedAt: Date.now(),
-    site,
-    refresh: true,
-  };
-}
-
-// input = judul lagu ATAU link
-async function resolve(input) {
-  const isUrl = /^https?:\/\//i.test(input);
-
-  // link audio/video langsung (mp3, radio stream, dll)
-  if (isUrl && !isYouTubeUrl(input) && !isSoundCloudUrl(input)) {
-    return { title: input, pageUrl: input, streamUrl: input, resolvedAt: Date.now(), site: 'direct', refresh: false };
-  }
-
-  // link YouTube / SoundCloud
-  if (isUrl) {
-    const site = isYouTubeUrl(input) ? 'youtube' : 'soundcloud';
-    try {
-      return await extract(input, site);
-    } catch (e) {
-      console.error('[yt-dlp]', e.stderr || e.message);
-      throw new Error('Gagal mengambil audio dari link itu (lihat log). Bisa diblokir atau tidak tersedia.');
-    }
-  }
-
-  // judul lagu -> cari
-  const order = [SEARCH_SOURCE];
-  if (SEARCH_FALLBACK && SEARCH_FALLBACK !== SEARCH_SOURCE) order.push(SEARCH_FALLBACK);
-
-  let lastErr;
-  for (const site of order) {
-    const prefix = site === 'youtube' ? 'ytsearch1' : 'scsearch1';
-    try {
-      return await extract(`${prefix}:${input}`, site);
-    } catch (e) {
-      lastErr = e;
-      console.error(`[yt-dlp] ${site} gagal:`, (e.stderr || e.message || '').toString().split('\n').slice(-3).join(' | '));
-    }
-  }
-  console.error('[resolve] semua sumber gagal', lastErr?.message);
-  throw new Error(`Lagu "${input}" tidak ditemukan atau diblokir. Coba tambahkan nama artis.`);
-}
-
-async function freshStreamUrl(item) {
-  if (item.refresh && Date.now() - item.resolvedAt > URL_MAX_AGE) {
-    const r = await extract(item.pageUrl, item.site);
-    item.streamUrl = r.streamUrl;
-    item.resolvedAt = r.resolvedAt;
-  }
-  return item.streamUrl;
-}
-
 // ---------- util ----------
-function killFfmpeg() {
-  try { ffmpeg?.kill('SIGKILL'); } catch {}
-  ffmpeg = null;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function waitFor(cond, ms, message) {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    if (cond()) return;
+    await sleep(250);
+  }
+  throw new Error(message);
 }
 
 function say(text) {
   state.notify?.send(text).catch(() => {});
 }
 
-// ---------- voice ----------
-async function ensureVoice(channel) {
-  if (state.guildId && state.guildId !== channel.guildId) {
-    try { getVoiceConnection(state.guildId)?.destroy(); } catch {}
-  }
-
-  let conn = getVoiceConnection(channel.guildId);
-  const needNew =
-    !conn ||
-    conn.joinConfig.channelId !== channel.id ||
-    conn.state.status === VoiceConnectionStatus.Destroyed;
-
-  if (needNew) {
-    try { conn?.destroy(); } catch {}
-    const guildId = channel.guildId;
-    conn = joinVoiceChannel({
-      channelId: channel.id,
-      guildId,
-      adapterCreator: channel.guild.voiceAdapterCreator,
-      selfDeaf: false,
-      selfMute: false,
-    });
-    conn.on('stateChange', (o, n) => console.log(`[voice] ${o.status} -> ${n.status}`));
-    conn.on('error', (e) => console.error('[voice error]', e));
-    conn.on(VoiceConnectionStatus.Disconnected, async () => {
-      try {
-        await Promise.race([
-          entersState(conn, VoiceConnectionStatus.Signalling, 5000),
-          entersState(conn, VoiceConnectionStatus.Connecting, 5000),
-        ]); // sedang pindah channel / reconnect
-      } catch {
-        try { conn.destroy(); } catch {}
-      }
-    });
-    conn.on(VoiceConnectionStatus.Destroyed, () => {
-      if (state.guildId === guildId) {
-        state.guildId = null;
-        state.channelId = null;
-      }
-    });
-  }
-
-  state.guildId = channel.guildId;
-  state.channelId = channel.id;
-
-  try {
-    await entersState(conn, VoiceConnectionStatus.Ready, 20000);
-  } catch {
-    try { conn.destroy(); } catch {}
-    state.guildId = null;
-    state.channelId = null;
-    throw new Error('Voice tidak tersambung dalam 20 detik (lihat log [voice]).');
-  }
-  conn.subscribe(player);
-  console.log('[join] voice Ready');
-}
-
-// cari voice channel tempat user yang DM sedang berada
 function findUserVoiceChannelId(userId) {
   for (const guild of client.guilds.cache.values()) {
     const vs = guild.voiceStates?.cache.get(userId);
@@ -225,35 +71,198 @@ function findUserVoiceChannelId(userId) {
   return null;
 }
 
+// ---------- Lavalink: REST ----------
+async function lava(method, path, body) {
+  const r = await fetch(`${HTTP_BASE}${path}`, {
+    method,
+    headers: { Authorization: LAVALINK_PASSWORD, 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await r.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch {}
+  if (!r.ok) throw new Error(`Lavalink ${r.status}: ${data?.message || text.slice(0, 200)}`);
+  return data;
+}
+
+const playerPath = () => `/v4/sessions/${lavaSession}/players/${voice.guildId}`;
+
+async function patchPlayer(body) {
+  await waitFor(() => lavaSession, 15000, 'Lavalink belum tersambung (cek log [lavalink]).');
+  return lava('PATCH', playerPath(), body);
+}
+
+// ---------- Lavalink: WebSocket ----------
+function connectLavalink() {
+  ws = new WebSocket(`${WS_BASE}/v4/websocket`, {
+    headers: {
+      Authorization: LAVALINK_PASSWORD,
+      'User-Id': client.user.id,
+      'Client-Name': 'selfbot-lavalink/1.0',
+    },
+  });
+  ws.on('open', () => console.log('[lavalink] websocket terhubung'));
+  ws.on('message', (raw) => {
+    let m;
+    try { m = JSON.parse(raw); } catch { return; }
+    handleLavalink(m).catch((e) => console.error('[lavalink handler]', e));
+  });
+  ws.on('error', (e) => console.error('[lavalink] error:', e.message));
+  ws.on('close', (code) => {
+    console.error('[lavalink] websocket putus, kode', code, '-> coba lagi 5 detik');
+    lavaSession = null;
+    voice.pushed = false;
+    setTimeout(connectLavalink, 5000);
+  });
+}
+
+async function handleLavalink(m) {
+  if (m.op === 'ready') {
+    lavaSession = m.sessionId;
+    console.log('[lavalink] siap, session', lavaSession);
+    // setelah reconnect: kirim ulang data voice dan lanjutkan lagu yang tadi diputar
+    if (voice.guildId) {
+      await pushVoice().catch((e) => console.error('[voice push]', e.message));
+      if (state.current) await startTrack(state.current).catch((e) => console.error('[resume]', e.message));
+    }
+    return;
+  }
+  if (m.op !== 'event') return;
+
+  switch (m.type) {
+    case 'TrackEndEvent':
+      await onTrackEnd(m.reason);
+      break;
+    case 'TrackExceptionEvent':
+      console.error('[track error]', m.exception?.message, m.exception?.cause);
+      break;
+    case 'TrackStuckEvent':
+      console.error('[track stuck]', state.current?.title);
+      if (state.current) {
+        state.skipFlag = true;
+        await patchPlayer({ track: { encoded: null } }).catch(() => {});
+      }
+      break;
+    case 'WebSocketClosedEvent':
+      console.error('[voice ditutup oleh Discord]', m.code, m.reason);
+      break;
+  }
+}
+
+// ---------- voice (jembatan selfbot -> Lavalink) ----------
+function sendGateway(guildId, payload) {
+  const guild = client.guilds.cache.get(guildId);
+  if (guild?.shard?.send) return guild.shard.send(payload);
+  if (client.ws?.broadcast) return client.ws.broadcast(payload);
+  throw new Error('Tidak bisa mengirim voice state ke gateway (API library berbeda). Kirim info versi library ke pembuat kode.');
+}
+
+async function pushVoice() {
+  const { guildId, channelId, sessionId, token, endpoint } = voice;
+  if (!lavaSession || !guildId || !channelId || !sessionId || !token || !endpoint) return;
+  await lava('PATCH', `/v4/sessions/${lavaSession}/players/${guildId}`, {
+    voice: { token, endpoint, sessionId, channelId },
+  });
+  voice.pushed = true;
+  console.log('[voice] data voice dikirim ke Lavalink');
+}
+
+client.on('raw', (p) => {
+  if (!p?.t || !p.d) return;
+
+  if (p.t === 'VOICE_STATE_UPDATE' && p.d.user_id === client.user.id) {
+    console.log(`[voice-state] channel=${p.d.channel_id}`);
+    if (p.d.channel_id) {
+      voice.sessionId = p.d.session_id;
+      pushVoice().catch((e) => console.error('[voice push]', e.message));
+    } else if (voice.guildId) {
+      // ditendang / diputus dari voice
+      console.log('[voice] terputus dari voice channel');
+      forcedLeave();
+    }
+  }
+
+  if (p.t === 'VOICE_SERVER_UPDATE' && p.d.guild_id === voice.guildId) {
+    voice.token = p.d.token;
+    voice.endpoint = p.d.endpoint;
+    console.log('[voice] server update:', p.d.endpoint);
+    pushVoice().catch((e) => console.error('[voice push]', e.message));
+  }
+});
+
+async function joinChannel(channel) {
+  if (voice.guildId === channel.guildId && voice.channelId === channel.id && voice.pushed) return;
+  if (voice.guildId) await leaveChannel();
+
+  Object.assign(voice, { guildId: channel.guildId, channelId: channel.id, token: null, endpoint: null, pushed: false });
+  sendGateway(channel.guildId, {
+    op: 4,
+    d: { guild_id: channel.guildId, channel_id: channel.id, self_mute: false, self_deaf: false },
+  });
+  try {
+    await waitFor(() => voice.pushed, 20000, 'Voice tidak tersambung dalam 20 detik (cek log [voice] dan [lavalink]).');
+  } catch (e) {
+    await leaveChannel();
+    throw e;
+  }
+}
+
+async function leaveChannel() {
+  const g = voice.guildId;
+  if (!g) return;
+  try { if (lavaSession) await lava('DELETE', `/v4/sessions/${lavaSession}/players/${g}`); } catch {}
+  try { sendGateway(g, { op: 4, d: { guild_id: g, channel_id: null, self_mute: false, self_deaf: false } }); } catch {}
+  Object.assign(voice, { guildId: null, channelId: null, token: null, endpoint: null, pushed: false });
+}
+
+function forcedLeave() {
+  Object.assign(voice, { guildId: null, channelId: null, token: null, endpoint: null, pushed: false });
+  state.queue = [];
+  state.current = null;
+  say('⚠️ Bot terputus dari voice channel.');
+}
+
+// ---------- pencarian lagu ----------
+async function loadTracks(identifier) {
+  const r = await lava('GET', `/v4/loadtracks?identifier=${encodeURIComponent(identifier)}`);
+  if (r.loadType === 'track') return [r.data];
+  if (r.loadType === 'search') return r.data.slice(0, 1);
+  if (r.loadType === 'playlist') return r.data.tracks.slice(0, MAX_PLAYLIST);
+  if (r.loadType === 'error') throw new Error(r.data?.message || 'gagal memuat');
+  return []; // empty
+}
+
+const toItem = (t) => ({ title: t.info.title, author: t.info.author, encoded: t.encoded, uri: t.info.uri });
+
+// input = judul lagu ATAU link (video / playlist)
+async function resolve(input) {
+  const isUrl = /^https?:\/\//i.test(input);
+  const ids = isUrl ? [input] : SEARCH_ORDER.map((p) => `${p}:${input}`);
+
+  let lastErr;
+  for (const id of ids) {
+    try {
+      const tracks = await loadTracks(id);
+      if (tracks.length) return tracks.map(toItem);
+      console.log(`[search] ${id} -> kosong`);
+    } catch (e) {
+      lastErr = e;
+      console.error(`[search] ${id} -> ${e.message}`);
+    }
+  }
+  throw new Error(lastErr ? `Gagal memuat lagu: ${lastErr.message}` : `Lagu "${input}" tidak ditemukan. Coba tambahkan nama artis.`);
+}
+
 // ---------- pemutaran ----------
 async function startTrack(item) {
-  const url = await freshStreamUrl(item);
-
-  killFfmpeg();
   state.current = item;
   state.startedAt = Date.now();
-
-  const ffArgs = ['-hide_banner', '-loglevel', 'warning'];
-  if (YT_PROXY && item.site === 'youtube') ffArgs.push('-http_proxy', YT_PROXY);
-  ffArgs.push(
-    '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
-    '-i', url,
-    '-vn', '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1',
-  );
-
-  const proc = spawn('ffmpeg', ffArgs);
-  ffmpeg = proc;
-  proc.stderr.on('data', (d) => console.error('[ffmpeg]', d.toString().trim()));
-  proc.stdout.on('error', () => {});
-  proc.on('error', (e) => console.error('[ffmpeg start]', e.message));
-
-  const resource = createAudioResource(proc.stdout, {
-    inputType: StreamType.Raw,
-    inlineVolume: true,
-  });
-  resource.volume?.setVolume(state.volume);
-  state.resource = resource;
-  player.play(resource);
+  try {
+    await patchPlayer({ track: { encoded: item.encoded }, volume: Math.round(state.volume * 100), paused: false });
+  } catch (e) {
+    state.current = null;
+    throw e;
+  }
   console.log(`[play] ${item.title}`);
 }
 
@@ -270,15 +279,17 @@ async function advance(next, announce) {
     }
   }
   state.current = null;
-  state.resource = null;
   say('⏹️ Antrean habis. Bot tetap di voice (`,leave` untuk keluar).');
 }
 
-async function onTrackEnd() {
+async function onTrackEnd(reason) {
+  if (!state.current) return;                           // sudah di-stop manual
+  if (reason === 'replaced' || reason === 'cleanup') return;
+
   const ended = state.current;
   const skipped = state.skipFlag;
   state.skipFlag = false;
-  const failed = !skipped && Date.now() - state.startedAt < 3000; // lagu langsung mati = gagal
+  const failed = reason === 'loadFailed' || (!skipped && Date.now() - state.startedAt < 3000);
 
   let next;
   if (state.loop === 'track' && !skipped && !failed) {
@@ -290,26 +301,20 @@ async function onTrackEnd() {
   await advance(next, true);
 }
 
-player.on('error', (e) => console.error('[player]', e.message));
-player.on(AudioPlayerStatus.Idle, () => {
-  killFfmpeg();
-  if (!state.current) return; // sudah di-stop manual
-  onTrackEnd().catch((e) => console.error('[onTrackEnd]', e));
-});
-
-function clearAll() {
+async function clearAll() {
   state.queue = [];
   state.current = null;
-  state.resource = null;
   state.skipFlag = false;
-  killFfmpeg();
-  try { player.stop(true); } catch {}
+  if (voice.guildId) await patchPlayer({ track: { encoded: null } }).catch(() => {});
 }
 
 // ---------- command ----------
 const LOOP_LABEL = { off: 'mati', track: 'lagu ini', queue: 'seluruh antrean' };
 
-client.on('ready', () => console.log(`Login sebagai ${client.user.tag} | sumber: ${SEARCH_SOURCE}${SEARCH_FALLBACK ? ` (+${SEARCH_FALLBACK})` : ''}`));
+client.on('ready', () => {
+  console.log(`Login sebagai ${client.user.tag} | Lavalink: ${HTTP_BASE} | sumber: ${SEARCH_ORDER.join(', ')}`);
+  connectLavalink();
+});
 
 client.on('messageCreate', async (msg) => {
   console.log(`[msg] type=${msg.channel.type} from=${msg.author.tag} content=${msg.content}`);
@@ -332,27 +337,31 @@ client.on('messageCreate', async (msg) => {
         if (!arg) return msg.reply('Pakai: `,play <judul lagu>` contoh: `,play hindia rumah ke rumah`');
 
         const userChannelId = findUserVoiceChannelId(msg.author.id);
-        const channelId = userChannelId ?? state.channelId ?? DEFAULT_CHANNEL_ID;
+        const channelId = userChannelId ?? voice.channelId ?? DEFAULT_CHANNEL_ID;
         console.log(`[play] user=${msg.author.tag} userChannel=${userChannelId} pakai=${channelId}`);
         if (!channelId) {
           return msg.reply('Kamu belum ada di voice channel (di server yang sama dengan akun ini). Masuk voice dulu, lalu `,play` lagi.');
         }
         if (state.queue.length >= MAX_QUEUE) return msg.reply(`Antrean penuh (maks ${MAX_QUEUE}).`);
 
-        const item = await resolve(arg);
+        const items = await resolve(arg);
 
         const channel = await client.channels.fetch(channelId);
         if (!channel?.guildId) throw new Error('Channel tidak ditemukan atau bukan voice channel server.');
         const perms = channel.permissionsFor?.(client.user);
         console.log(`[join] ${channel.name} connect=${perms?.has('CONNECT')} speak=${perms?.has('SPEAK')} userLimit=${channel.userLimit}`);
-        await ensureVoice(channel);
+        await joinChannel(channel);
 
         if (!state.current) {
-          await startTrack(item);
-          await msg.reply(`▶️ Memutar: ${item.title}\n🔊 Di: ${channel.name}`);
+          const first = items.shift();
+          state.queue.push(...items);
+          await startTrack(first);
+          await msg.reply(`▶️ Memutar: ${first.title}${first.author ? ` — ${first.author}` : ''}\n🔊 Di: ${channel.name}${items.length ? `\n➕ +${items.length} lagu ke antrean` : ''}`);
         } else {
-          state.queue.push(item);
-          await msg.reply(`➕ Ditambahkan ke antrean #${state.queue.length}: ${item.title}`);
+          state.queue.push(...items);
+          await msg.reply(items.length > 1
+            ? `➕ ${items.length} lagu ditambahkan ke antrean.`
+            : `➕ Ditambahkan ke antrean #${state.queue.length}: ${items[0].title}`);
         }
         break;
       }
@@ -362,7 +371,7 @@ client.on('messageCreate', async (msg) => {
         if (!state.current) return msg.reply('Tidak ada lagu yang sedang diputar.');
         const title = state.current.title;
         state.skipFlag = true;
-        player.stop(true); // memicu Idle -> lanjut lagu berikutnya
+        await patchPlayer({ track: { encoded: null } }); // memicu TrackEnd -> lagu berikutnya
         await msg.reply(`⏭️ Dilewati: ${title}`);
         break;
       }
@@ -398,39 +407,35 @@ client.on('messageCreate', async (msg) => {
         const n = Number(arg.replace('%', ''));
         if (!Number.isFinite(n) || n < 0 || n > 200) return msg.reply('Pakai: `,volume <0-200>` (100 = normal)');
         state.volume = n / 100;
-        state.resource?.volume?.setVolume(state.volume);
+        if (voice.guildId) await patchPlayer({ volume: Math.round(n) });
         await msg.reply(`🔊 Volume: ${n}%`);
         break;
       }
 
       case ',np': {
         if (!state.current) return msg.reply('Tidak ada lagu yang sedang diputar.');
-        await msg.reply(`🎵 ${state.current.title}\nLoop: ${LOOP_LABEL[state.loop]} | Volume: ${Math.round(state.volume * 100)}% | Antrean: ${state.queue.length}`);
+        await msg.reply(`🎵 ${state.current.title}${state.current.author ? ` — ${state.current.author}` : ''}\nLoop: ${LOOP_LABEL[state.loop]} | Volume: ${Math.round(state.volume * 100)}% | Antrean: ${state.queue.length}`);
         break;
       }
 
       case ',pause':
-        player.pause();
+        await patchPlayer({ paused: true });
         await msg.reply('⏸️ Pause.');
         break;
 
       case ',resume':
-        player.unpause();
+        await patchPlayer({ paused: false });
         await msg.reply('▶️ Lanjut.');
         break;
 
       case ',stop':
-        clearAll(); // bot TETAP di voice
+        await clearAll(); // bot TETAP di voice
         await msg.reply('⏹️ Dihentikan & antrean dikosongkan. Bot tetap di voice (`,leave` untuk keluar).');
         break;
 
       case ',leave':
-        clearAll();
-        if (state.guildId) {
-          try { getVoiceConnection(state.guildId)?.destroy(); } catch {}
-        }
-        state.guildId = null;
-        state.channelId = null;
+        await clearAll();
+        await leaveChannel();
         await msg.reply('👋 Keluar dari voice.');
         break;
     }
