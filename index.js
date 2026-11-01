@@ -19,6 +19,10 @@ if (!USER_TOKEN || !LAVALINK_PASSWORD) {
 const SEARCH_ORDER = (process.env.SEARCH_ORDER || 'scsearch,ytmsearch,ytsearch')
   .split(',').map((s) => s.trim()).filter(Boolean);
 
+// mode senyap: sedikit pesan keluar
+const QUIET = (process.env.QUIET ?? 'true') !== 'false';
+const ACK = (process.env.ACK || 'react').toLowerCase(); // react | text | none
+
 const secure = LAVALINK_SECURE === 'true';
 const hostPort = LAVALINK_PORT ? `${LAVALINK_HOST}:${LAVALINK_PORT}` : LAVALINK_HOST;
 const HTTP_BASE = `${secure ? 'https' : 'http'}://${hostPort}`;
@@ -36,7 +40,7 @@ const state = {
   volume: 1,       // 1 = 100%
   startedAt: 0,
   skipFlag: false,
-  notify: null,    // DM channel untuk pengumuman pergantian lagu
+  notify: null,    // DM channel untuk pesan penting
 };
 
 // data voice yang diteruskan ke Lavalink
@@ -60,8 +64,23 @@ async function waitFor(cond, ms, message) {
   throw new Error(message);
 }
 
-function say(text) {
+// pesan spontan dari bot. 'info' ditahan di mode senyap, 'error' selalu dikirim
+function say(text, level = 'info') {
+  if (QUIET && level === 'info') {
+    console.log('[info]', text);
+    return;
+  }
   state.notify?.send(text).catch(() => {});
+}
+
+// konfirmasi sukses untuk sebuah command
+async function ack(msg, text) {
+  try {
+    if (ACK === 'text') await msg.reply(text);
+    else if (ACK === 'react') await msg.react('✅');
+  } catch (e) {
+    console.error('[ack]', e.message);
+  }
 }
 
 function findUserVoiceChannelId(userId) {
@@ -96,25 +115,37 @@ async function patchPlayer(body) {
 // ---------- Lavalink: WebSocket ----------
 function connectLavalink() {
   clearTimeout(reconnectTimer);
-  try { ws?.removeAllListeners(); ws?.terminate(); } catch {}
+  try {
+    ws?.removeAllListeners();
+    ws?.on('error', () => {}); // cegah crash kalau socket lama melempar error saat ditutup
+    ws?.terminate();
+  } catch {}
 
-  ws = new WebSocket(`${WS_BASE}/v4/websocket`, {
+  const sock = new WebSocket(`${WS_BASE}/v4/websocket`, {
+    handshakeTimeout: 10000, // gagal cepat (10 detik), bukan menggantung
     headers: {
       Authorization: LAVALINK_PASSWORD,
       'User-Id': client.user.id,
       'Client-Name': 'selfbot-lavalink/1.0',
     },
   });
+  ws = sock;
 
-  ws.on('open', () => console.log('[lavalink] websocket terhubung'));
+  // setiap handler mengabaikan socket lama supaya tidak ada reconnect ganda
+  sock.on('open', () => {
+    if (sock !== ws) return;
+    console.log('[lavalink] websocket terhubung');
+  });
 
-  ws.on('message', (raw) => {
+  sock.on('message', (raw) => {
+    if (sock !== ws) return;
     let m;
     try { m = JSON.parse(raw); } catch { return; }
     handleLavalink(m).catch((e) => console.error('[lavalink handler]', e));
   });
 
-  ws.on('error', (e) => {
+  sock.on('error', (e) => {
+    if (sock !== ws) return;
     const detail =
       e.message ||
       e.code ||
@@ -123,7 +154,8 @@ function connectLavalink() {
     console.error('[lavalink] error:', detail);
   });
 
-  ws.on('close', (code, reason) => {
+  sock.on('close', (code, reason) => {
+    if (sock !== ws) return;
     console.error('[lavalink] websocket putus, kode', code, String(reason || ''), '-> coba lagi 5 detik');
     lavaSession = null;
     voice.pushed = false;
@@ -252,7 +284,7 @@ function forcedLeave() {
   Object.assign(voice, { guildId: null, channelId: null, token: null, endpoint: null, pushed: false });
   state.queue = [];
   state.current = null;
-  say('⚠️ Bot terputus dari voice channel.');
+  say('⚠️ Bot terputus dari voice channel.', 'error');
 }
 
 // ---------- pencarian lagu ----------
@@ -317,7 +349,7 @@ async function advance(next, announce) {
       return;
     } catch (e) {
       console.error('[advance]', e.message);
-      say(`⚠️ Dilewati (gagal): ${next.title}`);
+      say(`⚠️ Dilewati (gagal): ${next.title}`, 'error');
       next = state.queue.shift() ?? null;
     }
   }
@@ -371,7 +403,7 @@ async function clearAll() {
 const LOOP_LABEL = { off: 'mati', track: 'lagu ini', queue: 'seluruh antrean' };
 
 client.once('ready', () => {
-  console.log(`Login sebagai ${client.user.tag} | Lavalink: ${HTTP_BASE} | sumber: ${SEARCH_ORDER.join(', ')}`);
+  console.log(`Login sebagai ${client.user.tag} | Lavalink: ${HTTP_BASE} | sumber: ${SEARCH_ORDER.join(', ')} | senyap=${QUIET} ack=${ACK}`);
   connectLavalink();
 });
 
@@ -419,10 +451,10 @@ client.on('messageCreate', async (msg) => {
           const first = items.shift();
           state.queue.push(...items);
           await startTrack(first);
-          await msg.reply(`▶️ Memutar: ${first.title}${first.author ? ` — ${first.author}` : ''}\n🔊 Di: ${channel.name}${items.length ? `\n➕ +${items.length} lagu ke antrean` : ''}`);
+          await ack(msg, `▶️ Memutar: ${first.title}${first.author ? ` — ${first.author}` : ''}\n🔊 Di: ${channel.name}${items.length ? `\n➕ +${items.length} lagu ke antrean` : ''}`);
         } else {
           state.queue.push(...items);
-          await msg.reply(items.length > 1
+          await ack(msg, items.length > 1
             ? `➕ ${items.length} lagu ditambahkan ke antrean.`
             : `➕ Ditambahkan ke antrean #${state.queue.length}: ${items[0].title}`);
         }
@@ -435,7 +467,7 @@ client.on('messageCreate', async (msg) => {
         const title = state.current.title;
         state.skipFlag = true;
         await patchPlayer({ track: { encoded: null } }); // memicu TrackEnd -> lagu berikutnya
-        await msg.reply(`⏭️ Dilewati: ${title}`);
+        await ack(msg, `⏭️ Dilewati: ${title}`);
         break;
       }
 
@@ -460,7 +492,7 @@ client.on('messageCreate', async (msg) => {
         } else {
           state.loop = state.loop === 'off' ? 'track' : state.loop === 'track' ? 'queue' : 'off';
         }
-        await msg.reply(`🔁 Loop: ${LOOP_LABEL[state.loop]}`);
+        await ack(msg, `🔁 Loop: ${LOOP_LABEL[state.loop]}`);
         break;
       }
 
@@ -471,7 +503,7 @@ client.on('messageCreate', async (msg) => {
         if (!Number.isFinite(n) || n < 0 || n > 200) return msg.reply('Pakai: `,volume <0-200>` (100 = normal)');
         state.volume = n / 100;
         if (voice.guildId) await patchPlayer({ volume: Math.round(n) });
-        await msg.reply(`🔊 Volume: ${n}%`);
+        await ack(msg, `🔊 Volume: ${n}%`);
         break;
       }
 
@@ -483,23 +515,23 @@ client.on('messageCreate', async (msg) => {
 
       case ',pause':
         await patchPlayer({ paused: true });
-        await msg.reply('⏸️ Pause.');
+        await ack(msg, '⏸️ Pause.');
         break;
 
       case ',resume':
         await patchPlayer({ paused: false });
-        await msg.reply('▶️ Lanjut.');
+        await ack(msg, '▶️ Lanjut.');
         break;
 
       case ',stop':
         await clearAll(); // bot TETAP di voice
-        await msg.reply('⏹️ Dihentikan & antrean dikosongkan. Bot tetap di voice (`,leave` untuk keluar).');
+        await ack(msg, '⏹️ Dihentikan & antrean dikosongkan. Bot tetap di voice (`,leave` untuk keluar).');
         break;
 
       case ',leave':
         await clearAll();
         await leaveChannel();
-        await msg.reply('👋 Keluar dari voice.');
+        await ack(msg, '👋 Keluar dari voice.');
         break;
     }
   } catch (e) {
