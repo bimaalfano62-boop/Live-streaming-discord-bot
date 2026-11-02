@@ -15,8 +15,8 @@ if (!USER_TOKEN || !LAVALINK_PASSWORD) {
   process.exit(1);
 }
 
-// urutan pencarian: scsearch (SoundCloud), ytmsearch (YouTube Music), ytsearch (YouTube)
-const SEARCH_ORDER = (process.env.SEARCH_ORDER || 'scsearch,ytmsearch,ytsearch')
+// urutan pencarian: ytmsearch (YouTube Music), ytsearch (YouTube), scsearch (SoundCloud)
+const SEARCH_ORDER = (process.env.SEARCH_ORDER || 'ytmsearch,ytsearch')
   .split(',').map((s) => s.trim()).filter(Boolean);
 
 // mode senyap: sedikit pesan keluar
@@ -180,9 +180,12 @@ async function handleLavalink(m) {
     case 'TrackEndEvent':
       await onTrackEnd(m.reason);
       break;
-    case 'TrackExceptionEvent':
-      console.error('[track error]', m.exception?.message, m.exception?.cause);
+    case 'TrackExceptionEvent': {
+      // pesan singkat saja; stack trace Java dari Lavalink dipotong
+      const cause = String(m.exception?.cause || '').split('\n')[0].slice(0, 200);
+      console.error('[track error]', state.current?.title ?? '-', '|', m.exception?.message, cause ? `| ${cause}` : '');
       break;
+    }
     case 'TrackStuckEvent':
       console.error('[track stuck]', state.current?.title);
       if (state.current) {
@@ -293,20 +296,54 @@ async function loadTracks(identifier) {
   if (r.loadType === 'track') return [r.data];
   if (r.loadType === 'search') return r.data.slice(0, 1);
   if (r.loadType === 'playlist') return r.data.tracks.slice(0, MAX_PLAYLIST);
-  if (r.loadType === 'error') throw new Error(r.data?.message || 'gagal memuat');
+  if (r.loadType === 'error') {
+    console.error('[loadtracks error]', identifier, JSON.stringify({
+      message: r.data?.message,
+      severity: r.data?.severity,
+      cause: String(r.data?.cause || '').split('\n')[0].slice(0, 300),
+    }));
+    throw new Error(r.data?.message || 'gagal memuat');
+  }
   return []; // empty
 }
 
 const toItem = (t) => ({ title: t.info.title, author: t.info.author, encoded: t.encoded, uri: t.info.uri });
+
+// ambil ID video dari link YouTube / youtu.be / music.youtube.com
+function youtubeVideoId(u) {
+  try {
+    const x = new URL(u);
+    const h = x.hostname.replace(/^www\./, '');
+    if (h === 'youtu.be') return x.pathname.slice(1) || null;
+    if (['youtube.com', 'm.youtube.com', 'music.youtube.com'].includes(h)) return x.searchParams.get('v');
+  } catch {}
+  return null;
+}
 
 // input = judul lagu ATAU link (video / playlist); startIdx = mulai dari sumber ke-berapa di SEARCH_ORDER
 async function resolveFrom(input, startIdx = 0) {
   const isUrl = /^https?:\/\//i.test(input);
 
   if (isUrl) {
-    const tracks = await loadTracks(input);
-    if (!tracks.length) throw new Error('Link tidak ditemukan atau tidak bisa dimuat.');
-    return tracks.map(toItem);
+    // link asli dicoba dulu; kalau gagal, coba bentuk lain dari video yang sama
+    const candidates = [input];
+    const id = youtubeVideoId(input);
+    if (id) {
+      candidates.push(`https://www.youtube.com/watch?v=${id}`, `https://music.youtube.com/watch?v=${id}`);
+    }
+    let lastErr;
+    for (const url of [...new Set(candidates)]) {
+      try {
+        const tracks = await loadTracks(url);
+        if (tracks.length) return tracks.map(toItem);
+      } catch (e) {
+        lastErr = e;
+        console.error(`[load] ${url} -> ${e.message}`);
+      }
+    }
+    throw new Error(lastErr
+      ? `Link tidak bisa dimuat: ${lastErr.message}`
+      : 'Link tidak ditemukan atau tidak bisa dimuat.');
   }
 
   let lastErr;
@@ -439,7 +476,9 @@ client.on('messageCreate', async (msg) => {
         }
         if (state.queue.length >= MAX_QUEUE) return msg.reply(`Antrean penuh (maks ${MAX_QUEUE}).`);
 
-        const items = await resolve(arg);
+        // ambil link kalau ada di dalam teks, dan buang ",play" yang terketik dobel
+        const input = arg.match(/https?:\/\/\S+/i)?.[0] ?? arg.replace(/^,\s*(play|p)\s+/i, '');
+        const items = await resolve(input);
 
         const channel = await client.channels.fetch(channelId);
         if (!channel?.guildId) throw new Error('Channel tidak ditemukan atau bukan voice channel server.');
@@ -492,7 +531,8 @@ client.on('messageCreate', async (msg) => {
         } else {
           state.loop = state.loop === 'off' ? 'track' : state.loop === 'track' ? 'queue' : 'off';
         }
-        await ack(msg, `🔁 Loop: ${LOOP_LABEL[state.loop]}`);
+        // selalu dibalas teks: kamu perlu tahu mode yang sedang aktif
+        await msg.reply(`🔁 Loop: ${LOOP_LABEL[state.loop]}`);
         break;
       }
 
